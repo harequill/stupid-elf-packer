@@ -82,6 +82,9 @@ Com `-static`, não há `PT_INTERP` nem loader dinâmico envolvido. O kernel car
 
 Antes de empacotar qualquer coisa, precisamos saber ler a estrutura do binário. As ferramentas abaixo (`file` e `readelf`) mostram tudo o que o packer vai precisar.
 
+> **Por que o binário `target/target` está versionado no repositório?**
+> Normalmente não se commita artefato de build, mas aqui é proposital. Os valores mostrados nas saídas abaixo (entry point, offsets e tamanhos dos segmentos, BuildID) são fixos para *este* binário, mas dependem do toolchain que o gerou: recompilar com outra versão de gcc/ld/glibc, com outras flags ou com outro linker pode deslocar o layout e mudar esses números. Versionar o binário garante que, ao rodar os comandos deste README, você veja exatamente os mesmos dados aqui documentados. (Os comandos `file`/`readelf` só *leem* o binário; quem muda os valores é a recompilação, não a execução deles.)
+
 ### `file target`
 
 ```
