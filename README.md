@@ -142,6 +142,48 @@ hello, i am the packer target42
 
 Sai o texto definido no `printf` e, logo em seguida, `42` (o `echo $?` mostra o código de saída, que é o `return 42` do `main`). Esse é o comportamento de referência: depois de empacotar e desempacotar, o binário tem que produzir **exatamente** essa mesma saída e esse mesmo código de retorno.
 
+## A ferramenta (tool)
+
+A `tool` é o programa que empacota o alvo: ela lê o ELF, cifra o segmento de código e injeta o stub. Ela é construída em passos, e cada passo é documentado aqui conforme entra.
+
+### Estruturas do ELF que interessam
+
+Um ELF de 64 bits, no que importa para este passo, tem três estruturas, todas definidas em `elf.h`:
+
+- **`Elf64_Ehdr`** (ELF header): fica no offset `0` do arquivo. Ele dá o entry point original (OEP) e diz onde a tabela de program headers começa (`e_phoff`), quantas entradas ela tem (`e_phnum`) e o tamanho de cada entrada (`e_phentsize`).
+- **`Elf64_Phdr`** (program header): cada um descreve um segmento. Os campos que usamos: `p_type` (é `PT_LOAD`? `PT_NOTE`?), `p_flags` (tem o bit de execução?), `p_offset` (onde no arquivo), `p_vaddr` (onde na memória), `p_filesz` e `p_memsz` (tamanhos).
+- **A tabela de program headers** é só um array de `Elf64_Phdr` em sequência, começando no offset `e_phoff`.
+
+### Passo 1: validar que a entrada é um ELF
+
+Antes de interpretar qualquer campo, a tool confere o **magic number**: os primeiros bytes do arquivo têm que ser `0x7F` seguido de `'E'`, `'L'`, `'F'`. Se não bater, ela aborta com uma mensagem clara e retorna código de erro. Isso evita rodar em cima de lixo e interpretar bytes aleatórios como se fossem um ELF.
+
+Na prática, a tool lê um `Elf64_Ehdr` a partir do offset `0` e compara os primeiros `SELFMAG` (4) bytes de `e_ident` com a constante `ELFMAG` (`"\177ELF"`), ambas de `elf.h`:
+
+```c
+if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+    /* not an ELF: abort */
+}
+```
+
+Também tratamos dois erros de borda antes disso: arquivo que não abre e arquivo pequeno demais para conter um header inteiro.
+
+Compilação:
+
+```sh
+gcc -Wall -Wextra -o tool/tool tool/tool.c
+```
+
+Uso:
+
+```sh
+./tool/tool target/target
+# ok: 'target/target' is a valid ELF
+
+./tool/tool arquivo-qualquer
+# error: 'arquivo-qualquer' not an ELF (invalid magic number)
+```
+
 ## Status
 
-Em construção. O alvo já existe; `stub/`, `tool/` e `shared/` são os próximos passos.
+Em construção. Já existem: o alvo e o passo 1 da tool (validação de ELF). Próximos passos da tool: ler o `Elf64_Ehdr` (OEP e tabela de program headers), localizar o segmento de código (`PT_LOAD` com flag de execução) e o `PT_NOTE` a ser canibalizado. Depois vêm o `stub` e o código compartilhado em `shared/`.
