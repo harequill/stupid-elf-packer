@@ -184,6 +184,51 @@ Uso:
 # error: 'arquivo-qualquer' not an ELF (invalid magic number)
 ```
 
+### Passo 2: ler o ELF e localizar os segmentos
+
+No passo 1 lemos o arquivo com `fopen`/`fread` de propósito, porque mostra de forma explícita a leitura dos bytes do header. A partir daqui a tool passa a usar **`mmap`** do arquivo inteiro: o arquivo é mapeado na memória e tratado como um array de bytes, com ponteiros casteados direto em cima das structs (`Elf64_Ehdr`, `Elf64_Phdr`). É mais confortável e é exatamente como vamos querer trabalhar na hora de reescrever bytes na etapa de cifragem.
+
+Com o arquivo mapeado, a tool faz o seguinte:
+
+**Confirma as premissas da v1.** Lê a classe em `e_ident[EI_CLASS]` (tem que ser `ELFCLASS64`) e o `e_type`. Só aceitamos `ET_EXEC`. Se vier `ET_DYN`, o binário é PIE, e como o stub da v1 não faz relocação em runtime (ver a seção do `-no-pie`), a tool falha aqui com uma mensagem honesta em vez de produzir algo quebrado lá na frente.
+
+**Localiza a tabela de program headers.** Do header já temos `e_phoff` (onde a tabela começa), `e_phnum` (quantas entradas) e `e_phentsize` (tamanho de cada entrada). A tool avança de entrada em entrada usando `e_phentsize` como passo, em vez de assumir `sizeof(Elf64_Phdr)`, para confiar no que o header declara. Antes de ler, confere que a tabela cabe dentro do arquivo.
+
+**Itera e imprime cada program header.** Para cada entrada mostra `p_type`, `p_offset`, `p_vaddr`, `p_filesz`, `p_memsz` e as flags `R`/`W`/`E`. O objetivo é essa saída bater com o `readelf -l`, que é o nosso gabarito.
+
+**Marca os dois segmentos que interessam:**
+
+- O **`PT_LOAD` com o bit de execução (`PF_X`)** é o segmento de **código**. A região `p_offset .. p_offset + p_filesz` dele é o que será cifrado na etapa seguinte.
+- O **`PT_NOTE`** é o candidato a ser canibalizado e virar o `PT_LOAD` do stub mais adiante. Por enquanto só confirmamos que existe.
+
+**Imprime um resumo** com o OEP (`e_entry`), o índice/offset/tamanho do segmento de código e se achou o `PT_NOTE`.
+
+Exemplo de saída para o nosso alvo:
+
+```
+program headers (12 entries):
+idx type         offset             vaddr              filesz             memsz              flg
+  0 LOAD         0x0000000000000000 0x0000000000400000 0x0000000000000518 0x0000000000000518 R
+  1 LOAD         0x0000000000001000 0x0000000000401000 0x000000000007e7fd 0x000000000007e7fd R E
+  ...
+
+=== summary ===
+OEP (e_entry):   0x402e40
+code segment:    index 1, offset 0x1000, size 0x7e7fd (filesz)
+PT_NOTE:         found at index 4
+```
+
+#### Como validar
+
+Basta comparar com o `readelf` ao lado:
+
+```sh
+readelf -h target/target | grep 'Entry point'   # OEP tem que bater
+readelf -l target/target                          # segmentos e o R E têm que bater
+```
+
+Se os três dados conferem (entry point igual ao do `readelf -h`, o segmento `R E` igual ao que a tool marcou como código, e os program headers batendo com o `readelf -l`), a leitura do formato está dominada e a base para as próximas etapas está pronta.
+
 ## Status
 
-Em construção. Já existem: o alvo e o passo 1 da tool (validação de ELF). Próximos passos da tool: ler o `Elf64_Ehdr` (OEP e tabela de program headers), localizar o segmento de código (`PT_LOAD` com flag de execução) e o `PT_NOTE` a ser canibalizado. Depois vêm o `stub` e o código compartilhado em `shared/`.
+Em construção. Já existem: o alvo, o passo 1 da tool (validação de ELF) e o passo 2 (leitura via `mmap`, confirmação das premissas e localização do segmento de código e do `PT_NOTE`). Próximos passos: cifrar o segmento de código, construir o `stub` (decifra e salta para o OEP) e escrever o código compartilhado em `shared/`.
