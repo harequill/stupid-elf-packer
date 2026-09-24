@@ -1,1 +1,4 @@
 tool/tool
+stub/stub.bin
+.gitignore
+stub/stub.o
