@@ -36,9 +36,91 @@ static void flags_str(uint32_t f, char out[4]) {
     out[3] = '\0';
 }
 
+/*
+ * Produce a packed copy of the input: append the stub blob, turn the PT_NOTE
+ * at note_idx into a PT_LOAD that maps the stub, and point e_entry at it. The
+ * stub already carries the OEP hardcoded, so nothing is patched here.
+ */
+static int pack_elf(const char *out_path,
+                    const uint8_t *in, size_t in_size,
+                    const uint8_t *stub, size_t stub_size,
+                    unsigned note_idx) {
+    const uint64_t page = 0x1000;
+    const Elf64_Ehdr *ieh = (const Elf64_Ehdr *)in;
+
+    /* The stub lands right after the original bytes. */
+    uint64_t stub_off = in_size;
+
+    /* Pick a page-aligned virtual address above every existing segment, then
+     * add stub_off % page so that p_vaddr and p_offset are congruent modulo the
+     * page size; the kernel refuses the mapping otherwise. */
+    uint64_t max_end = 0;
+    for (unsigned i = 0; i < ieh->e_phnum; i++) {
+        const Elf64_Phdr *ph =
+            (const Elf64_Phdr *)(in + ieh->e_phoff + (uint64_t)i * ieh->e_phentsize);
+        if (ph->p_type == PT_LOAD) {
+            uint64_t end = ph->p_vaddr + ph->p_memsz;
+            if (end > max_end) max_end = end;
+        }
+    }
+    uint64_t vaddr_base = ((max_end + page - 1) & ~(page - 1)) + page; /* aligned + gap */
+    uint64_t stub_vaddr = vaddr_base + (stub_off % page);
+
+    size_t out_size = in_size + stub_size;
+
+    int fd = open(out_path, O_RDWR | O_CREAT | O_TRUNC, 0755);
+    if (fd < 0) {
+        fprintf(stderr, "error: cannot create '%s'\n", out_path);
+        return 1;
+    }
+    if (ftruncate(fd, (off_t)out_size) != 0) {
+        fprintf(stderr, "error: cannot size '%s'\n", out_path);
+        close(fd);
+        return 1;
+    }
+
+    uint8_t *out = mmap(NULL, out_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (out == MAP_FAILED) {
+        fprintf(stderr, "error: cannot mmap '%s'\n", out_path);
+        return 1;
+    }
+
+    /* Copy the original file, then append the stub blob. */
+    memcpy(out, in, in_size);
+    memcpy(out + stub_off, stub, stub_size);
+
+    /* Cannibalize the PT_NOTE into a PT_LOAD that maps the stub. */
+    Elf64_Phdr *ph =
+        (Elf64_Phdr *)(out + ieh->e_phoff + (uint64_t)note_idx * ieh->e_phentsize);
+    ph->p_type   = PT_LOAD;
+    ph->p_flags  = PF_R | PF_X;
+    ph->p_offset = stub_off;
+    ph->p_vaddr  = stub_vaddr;
+    ph->p_paddr  = stub_vaddr;
+    ph->p_filesz = stub_size;
+    ph->p_memsz  = stub_size;
+    ph->p_align  = page;
+
+    /* Redirect the entry point to the stub. */
+    ((Elf64_Ehdr *)out)->e_entry = stub_vaddr;
+
+    msync(out, out_size, MS_SYNC);
+    munmap(out, out_size);
+
+    printf("\n=== packed ===\n");
+    printf("output:          %s\n", out_path);
+    printf("stub blob:       %zu bytes at offset 0x%" PRIx64 "\n", stub_size, stub_off);
+    printf("stub vaddr:      0x%" PRIx64 "\n", stub_vaddr);
+    printf("new e_entry:     0x%" PRIx64 " (was 0x%" PRIx64 ")\n", stub_vaddr, ieh->e_entry);
+    printf("cannibalized ph: index %u (PT_NOTE -> PT_LOAD)\n", note_idx);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "how to use: %s <elf-target>\n", argv[0]);
+    if (argc != 2 && argc != 4) {
+        fprintf(stderr, "how to use: %s <elf-target>                  (inspect)\n", argv[0]);
+        fprintf(stderr, "            %s <elf-target> <stub.bin> <out>  (pack)\n", argv[0]);
         return 1;
     }
 
@@ -172,6 +254,47 @@ int main(int argc, char **argv) {
     else
         printf("PT_NOTE:         not found\n");
 
+    /* Inspect-only mode stops here. */
+    if (argc != 4) {
+        munmap(base, size);
+        return 0;
+    }
+
+    /* Pack mode: we need a PT_NOTE to cannibalize and a stub blob to inject. */
+    if (note_idx < 0) {
+        fprintf(stderr, "error: no PT_NOTE to cannibalize\n");
+        munmap(base, size);
+        return 1;
+    }
+
+    FILE *sf = fopen(argv[2], "rb");
+    if (!sf) {
+        fprintf(stderr, "error: cannot open stub '%s'\n", argv[2]);
+        munmap(base, size);
+        return 1;
+    }
+    fseek(sf, 0, SEEK_END);
+    long ssize = ftell(sf);
+    fseek(sf, 0, SEEK_SET);
+    if (ssize <= 0) {
+        fprintf(stderr, "error: stub '%s' is empty\n", argv[2]);
+        fclose(sf);
+        munmap(base, size);
+        return 1;
+    }
+    uint8_t *stub = malloc((size_t)ssize);
+    if (!stub || fread(stub, 1, (size_t)ssize, sf) != (size_t)ssize) {
+        fprintf(stderr, "error: cannot read stub '%s'\n", argv[2]);
+        free(stub);
+        fclose(sf);
+        munmap(base, size);
+        return 1;
+    }
+    fclose(sf);
+
+    int rc = pack_elf(argv[3], base, size, stub, (size_t)ssize, (unsigned)note_idx);
+
+    free(stub);
     munmap(base, size);
-    return 0;
+    return rc;
 }
