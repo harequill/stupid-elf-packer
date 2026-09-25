@@ -229,6 +229,75 @@ readelf -l target/target                          # segmentos e o R E têm que b
 
 Se os três dados conferem (entry point igual ao do `readelf -h`, o segmento `R E` igual ao que a tool marcou como código, e os program headers batendo com o `readelf -l`), a leitura do formato está dominada e a base para as próximas etapas está pronta.
 
+## Aquisição de controle: o stub identidade
+
+Aqui vem a parte contra-intuitiva, então vale explicar antes de qualquer código.
+
+O instinto é começar pela criptografia, afinal "empacotar" soa como "cifrar". Mas a gente faz o contrário: primeiro constrói o mecanismo de aquisição de controle **sem cifrar nada**. O alvo continua em plain-text. O objetivo desta fase é provar, isoladamente, que a tool consegue desviar o fluxo de execução para o stub e devolvê-lo limpo para o alvo. Só depois disso a criptografia entra por cima de um esqueleto que já sabemos que funciona.
+
+Se a gente misturasse as duas coisas de uma vez e o binário empacotado quebrasse, não saberíamos se o problema está na cifragem ou na aquisição de controle. Separando, cada fase é depurável sozinha.
+
+A fase se divide em duas partes: o stub e a modificação que a tool faz no binário para dar controle a ele.
+
+### Parte 1: o stub mais burro possível
+
+O stub identidade ganha o controle e imediatamente salta para o OEP, sem fazer mais nada. Se o alvo roda normalmente com esse stub no caminho, está provado que o desvio e o retorno funcionam. É o "hello world" da aquisição de controle.
+
+Ele está em `stub/stub.s`, em assembly AT&T, e é literalmente isto:
+
+```asm
+_start:
+    movabs $0x402e40, %rax   /* OEP of target/target */
+    jmp    *%rax
+```
+
+Dois detalhes importantes:
+
+- **Ele não toca na pilha.** Nada de `push`, `call` ou mexer em registradores que o `_start` do alvo espera. Quando o kernel entrega o controle ao entry point, a pilha já está montada com `argc`/`argv`/`envp`/`auxv`. Como o stub só faz `movabs` + `jmp`, o `_start` do alvo recebe a pilha intacta, como se tivesse ganho o controle direto do kernel.
+- **O salto é absoluto**, o que torna esses bytes independentes de onde o stub for carregado na memória.
+
+Por enquanto o OEP `0x402e40` está chumbado no stub. Na evolução natural, a tool passaria a patchar esse valor a partir do `e_entry` que ela já lê, deixando o stub genérico.
+
+Montagem do stub (não há `nasm` aqui; usamos o GNU `as` mais `objcopy` para extrair os bytes crus):
+
+```sh
+as stub/stub.s -o stub/stub.o
+objcopy -O binary --only-section=.text stub/stub.o stub/stub.bin
+```
+
+O resultado é um blob de 12 bytes (`48 b8 40 2e 40 00 00 00 00 00 ff e0`) que a tool vai injetar.
+
+### Parte 2: a tool injeta o stub e desvia o entry point
+
+Até aqui a tool só lia o ELF. Agora ela passa a escrever, produzindo uma cópia empacotada (o alvo original é preservado):
+
+```sh
+./tool/tool target/target stub/stub.bin target/packed
+```
+
+O que ela faz, em ordem:
+
+1. **Anexa o blob do stub no fim do arquivo.** Um append simples dos bytes do stub ao final do binário, guardando em que offset ele caiu.
+2. **Converte o `PT_NOTE` em `PT_LOAD`.** Aquele program header `PT_NOTE` que localizamos no passo 2 vira um segmento carregável apontando para o stub. A tool reescreve os campos dele: `p_type` para `PT_LOAD`, `p_flags` com o bit de execução ligado (`R E`), e `p_offset`/`p_vaddr`/`p_filesz`/`p_memsz` apontando para onde o stub foi parar. É isso que faz o kernel mapear o stub na memória em runtime. Canibalizar um `PT_NOTE` (metadado descartável para a execução) evita ter que realocar a tabela de program headers inteira.
+3. **Redireciona o entry point.** Troca o `e_entry` do header para o endereço de memória onde o stub vai viver. A partir daí, quando o binário roda, o kernel entrega o controle ao stub, e não ao `main`; o stub salta para o OEP chumbado e o alvo executa.
+
+Dois cuidados são o que separam "funciona" de "o kernel recusa carregar":
+
+- **Alinhamento `p_vaddr` versus `p_offset`.** O ELF exige que os dois sejam congruentes módulo o tamanho de página (`0x1000`). A tool escolhe um `p_vaddr` de base alinhado à página e soma `p_offset % página`, garantindo a congruência. Endereços que não respeitam isso fazem o kernel recusar o binário.
+- **`p_vaddr` sem colisão.** O endereço onde o stub vai morar precisa ser uma faixa livre, bem acima dos segmentos existentes. A tool calcula o maior `p_vaddr + p_memsz` de todos os `PT_LOAD`, arredonda para a página seguinte e adiciona uma folga. Se caísse em cima de algo já mapeado, quebraria.
+
+#### A prova
+
+```sh
+./target/packed ; echo $?
+# hello, i am the packer target42
+
+readelf -h target/packed | grep 'Entry point'
+# Entry point address: 0x4c2290   (o stub, e não mais 0x402e40)
+```
+
+O empacotado produz exatamente a mesma saída e o mesmo código de retorno (`42`) do original, mas agora o controle passou pelo stub antes de chegar ao alvo. Com esse esqueleto provado, a etapa seguinte (cifrar o segmento de código e mandar o stub decifrar antes de saltar) entra sobre uma base confiável.
+
 ## Status
 
-Em construção. Já existem: o alvo, o passo 1 da tool (validação de ELF) e o passo 2 (leitura via `mmap`, confirmação das premissas e localização do segmento de código e do `PT_NOTE`). Próximos passos: cifrar o segmento de código, construir o `stub` (decifra e salta para o OEP) e escrever o código compartilhado em `shared/`.
+Em construção. Já existem: o alvo, a tool (validação de ELF, leitura via `mmap`, e injeção do stub com `PT_NOTE` para `PT_LOAD` e redirecionamento do `e_entry`) e o stub identidade (aquisição de controle provada). Próximos passos: cifrar o segmento de código, fazer o stub decifrá-lo antes de saltar para o OEP, e o código compartilhado em `shared/`.
