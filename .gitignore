@@ -1,3 +1,5 @@
 tool/tool
 stub/stub.bin
 stub/stub.o
+stub/stub_dyn.o
+stub/stub_dyn.bin
