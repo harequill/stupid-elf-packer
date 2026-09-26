@@ -298,6 +298,70 @@ readelf -h target/packed | grep 'Entry point'
 
 O empacotado produz exatamente a mesma saída e o mesmo código de retorno (`42`) do original, mas agora o controle passou pelo stub antes de chegar ao alvo. Com esse esqueleto provado, a etapa seguinte (cifrar o segmento de código e mandar o stub decifrar antes de saltar) entra sobre uma base confiável.
 
+## Passando o OEP para o stub: bloco de metadados
+
+O stub identidade tinha o OEP chumbado no código. Resolve um alvo só, mas não escala: cada alvo tem um OEP diferente, e logo vamos precisar passar mais coisa (chave, offset e tamanho da região cifrada). O stub precisa receber esses valores em runtime.
+
+O problema central: a tool sabe o OEP (leu do `e_entry`), o stub precisa dele quando roda. Os dois não compartilham memória nem variáveis. O único canal entre eles são os bytes que a tool escreve no arquivo e o stub lê quando executa. Passar o OEP é, então, a tool gravar o valor em algum lugar do binário e o stub saber ir ler exatamente esse lugar. Os dois precisam concordar sobre o lugar.
+
+### A abordagem: bloco de metadados em posição conhecida
+
+A tool anexa, junto do stub, uma pequena estrutura de dados numa posição previsível, e o stub lê de lá. As vantagens:
+
+- separa código de dados: o stub não muda quando o valor muda;
+- é escalável: agregar chave e offsets é só adicionar campos na struct;
+- a criptografia depois vira só mais campos, sem reescrever o stub.
+
+### A struct compartilhada
+
+Ela vive em `shared/packer.h` e é incluída pela tool. Por ora só carrega o OEP:
+
+```c
+struct packer_meta {
+    uint64_t oep;
+};
+```
+
+Por viver no `shared`, tool e stub concordam sobre o layout de bytes. É um campo só, `oep` no offset 0; conforme a struct cresce, o stub passa a ler cada campo pelo seu offset.
+
+### A tool grava a struct junto do stub
+
+Quando a tool anexa o stub no fim do arquivo, logo depois dos bytes do stub ela grava a struct preenchida com o OEP lido do `e_entry`. A posição é fixa e conhecida: imediatamente após o stub. O `PT_LOAD` que mapeia o stub é dimensionado para cobrir stub mais struct, senão a struct cairia fora do que o kernel mapeia e o stub leria memória inválida.
+
+### O stub encontra a struct e lê o OEP
+
+O stub dinâmico está em `stub/stub_dyn.s` (o identidade continua em `stub/stub.s`, os dois executáveis). Em vez do valor chumbado, ele descobre onde a struct está e lê de lá:
+
+```asm
+_start:
+    lea    meta(%rip), %rax   /* endereço da struct */
+    mov    (%rax), %rax        /* meta.oep */
+    jmp    *%rax
+meta:
+```
+
+O truque está no `lea` relativo ao RIP: o label `meta` é o primeiro byte depois do código do stub, e a tool grava a struct exatamente ali. Assim o stub calcula o endereço da struct em runtime a partir de onde ele mesmo foi carregado, sem depender de endereço fixo. Como `meta` fica no fim do código, o deslocamento é resolvido pelo próprio assembler.
+
+### A prova
+
+```sh
+# stub identidade (OEP chumbado); o passo anterior continua funcionando
+as stub/stub.s -o stub/stub.o
+objcopy -O binary --only-section=.text stub/stub.o stub/stub.bin
+./tool/tool target/target stub/stub.bin target/packed
+./target/packed ; echo $?
+# hello, i am the packer target42
+
+# stub dinâmico (lê o OEP da struct)
+as stub/stub_dyn.s -o stub/stub_dyn.o
+objcopy -O binary --only-section=.text stub/stub_dyn.o stub/stub_dyn.bin
+./tool/tool target/target stub/stub_dyn.bin target/packed_dyn
+./target/packed_dyn ; echo $?
+# hello, i am the packer target42
+```
+
+Os dois produzem a mesma saída. A diferença é que o `packed_dyn` tirou o OEP da struct, e não do código. É a base para, na etapa da criptografia, passar a chave e a região cifrada pelo mesmo canal.
+
 ## Status
 
-Em construção. Já existem: o alvo, a tool (validação de ELF, leitura via `mmap`, e injeção do stub com `PT_NOTE` para `PT_LOAD` e redirecionamento do `e_entry`) e o stub identidade (aquisição de controle provada). Próximos passos: cifrar o segmento de código, fazer o stub decifrá-lo antes de saltar para o OEP, e o código compartilhado em `shared/`.
+Em construção. Já existem: o alvo, a tool (validação de ELF, leitura via `mmap`, injeção do stub e escrita do bloco de metadados), o stub identidade e o stub dinâmico (que lê o OEP do bloco de metadados). Próximos passos: cifrar o segmento de código, fazer o stub decifrá-lo antes de saltar para o OEP, e o código compartilhado em `shared/`.
