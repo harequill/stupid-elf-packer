@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../shared/packer.h"
+
 /* Human-readable name for a program header type (matches `readelf -l`). */
 static const char *pt_name(uint32_t type) {
     switch (type) {
@@ -37,9 +39,9 @@ static void flags_str(uint32_t f, char out[4]) {
 }
 
 /*
- * Produce a packed copy of the input: append the stub blob, turn the PT_NOTE
- * at note_idx into a PT_LOAD that maps the stub, and point e_entry at it. The
- * stub already carries the OEP hardcoded, so nothing is patched here.
+ * Produce a packed copy of the input: append the stub followed by a
+ * packer_meta block (carrying the OEP), turn the PT_NOTE at note_idx into a
+ * PT_LOAD that maps both, and point e_entry at the stub.
  */
 static int pack_elf(const char *out_path,
                     const uint8_t *in, size_t in_size,
@@ -66,7 +68,8 @@ static int pack_elf(const char *out_path,
     uint64_t vaddr_base = ((max_end + page - 1) & ~(page - 1)) + page; /* aligned + gap */
     uint64_t stub_vaddr = vaddr_base + (stub_off % page);
 
-    size_t out_size = in_size + stub_size;
+    size_t blob_size = stub_size + sizeof(struct packer_meta);
+    size_t out_size = in_size + blob_size;
 
     int fd = open(out_path, O_RDWR | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
@@ -86,9 +89,11 @@ static int pack_elf(const char *out_path,
         return 1;
     }
 
-    /* Copy the original file, then append the stub blob. */
+    /* Copy the original file, then append the stub and the metadata block. */
     memcpy(out, in, in_size);
     memcpy(out + stub_off, stub, stub_size);
+    struct packer_meta meta = { .oep = ieh->e_entry };
+    memcpy(out + stub_off + stub_size, &meta, sizeof(meta));
 
     /* Cannibalize the PT_NOTE into a PT_LOAD that maps the stub. */
     Elf64_Phdr *ph =
@@ -98,8 +103,8 @@ static int pack_elf(const char *out_path,
     ph->p_offset = stub_off;
     ph->p_vaddr  = stub_vaddr;
     ph->p_paddr  = stub_vaddr;
-    ph->p_filesz = stub_size;
-    ph->p_memsz  = stub_size;
+    ph->p_filesz = blob_size;
+    ph->p_memsz  = blob_size;
     ph->p_align  = page;
 
     /* Redirect the entry point to the stub. */
@@ -110,8 +115,10 @@ static int pack_elf(const char *out_path,
 
     printf("\n=== packed ===\n");
     printf("output:          %s\n", out_path);
-    printf("stub blob:       %zu bytes at offset 0x%" PRIx64 "\n", stub_size, stub_off);
+    printf("blob:            %zu bytes (stub %zu + meta %zu) at offset 0x%" PRIx64 "\n",
+           blob_size, stub_size, sizeof(struct packer_meta), stub_off);
     printf("stub vaddr:      0x%" PRIx64 "\n", stub_vaddr);
+    printf("meta.oep:        0x%" PRIx64 "\n", meta.oep);
     printf("new e_entry:     0x%" PRIx64 " (was 0x%" PRIx64 ")\n", stub_vaddr, ieh->e_entry);
     printf("cannibalized ph: index %u (PT_NOTE -> PT_LOAD)\n", note_idx);
     return 0;
