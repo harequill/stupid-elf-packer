@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "../shared/packer.h"
+#include "../shared/xor.h"
 
 /* Human-readable name for a program header type (matches `readelf -l`). */
 static const char *pt_name(uint32_t type) {
@@ -39,14 +40,15 @@ static void flags_str(uint32_t f, char out[4]) {
 }
 
 /*
- * Produce a packed copy of the input: append the stub followed by a
- * packer_meta block (carrying the OEP), turn the PT_NOTE at note_idx into a
- * PT_LOAD that maps both, and point e_entry at the stub.
+ * Produce a packed copy of the input: optionally encrypt the code segment,
+ * append the stub followed by a packer_meta block, turn the PT_NOTE at note_idx
+ * into a PT_LOAD that maps both, and point e_entry at the stub.
  */
 static int pack_elf(const char *out_path,
                     const uint8_t *in, size_t in_size,
                     const uint8_t *stub, size_t stub_size,
-                    unsigned note_idx) {
+                    unsigned note_idx, unsigned code_idx,
+                    int encrypt, uint64_t key) {
     const uint64_t page = 0x1000;
     const Elf64_Ehdr *ieh = (const Elf64_Ehdr *)in;
 
@@ -89,10 +91,22 @@ static int pack_elf(const char *out_path,
         return 1;
     }
 
-    /* Copy the original file, then append the stub and the metadata block. */
+    /* Copy the original file. */
     memcpy(out, in, in_size);
-    memcpy(out + stub_off, stub, stub_size);
+
+    /* Encrypt the code segment first, then record where and how in the meta. */
     struct packer_meta meta = { .oep = ieh->e_entry };
+    if (encrypt) {
+        const Elf64_Phdr *code =
+            (const Elf64_Phdr *)(in + ieh->e_phoff + (uint64_t)code_idx * ieh->e_phentsize);
+        xor_apply(out + code->p_offset, code->p_filesz, key);
+        meta.code_addr = code->p_vaddr;
+        meta.code_size = code->p_filesz;
+        meta.key = key;
+    }
+
+    /* Append the stub and the metadata block. */
+    memcpy(out + stub_off, stub, stub_size);
     memcpy(out + stub_off + stub_size, &meta, sizeof(meta));
 
     /* Cannibalize the PT_NOTE into a PT_LOAD that maps the stub. */
@@ -121,13 +135,19 @@ static int pack_elf(const char *out_path,
     printf("meta.oep:        0x%" PRIx64 "\n", meta.oep);
     printf("new e_entry:     0x%" PRIx64 " (was 0x%" PRIx64 ")\n", stub_vaddr, ieh->e_entry);
     printf("cannibalized ph: index %u (PT_NOTE -> PT_LOAD)\n", note_idx);
+    if (encrypt)
+        printf("encrypted:       0x%" PRIx64 " bytes at vaddr 0x%" PRIx64 " with key 0x%" PRIx64 "\n",
+               meta.code_size, meta.code_addr, meta.key);
+    else
+        printf("encrypted:       no\n");
     return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2 && argc != 4) {
-        fprintf(stderr, "how to use: %s <elf-target>                  (inspect)\n", argv[0]);
-        fprintf(stderr, "            %s <elf-target> <stub.bin> <out>  (pack)\n", argv[0]);
+    if (argc != 2 && argc != 4 && argc != 5) {
+        fprintf(stderr, "how to use: %s <elf-target>                        (inspect)\n", argv[0]);
+        fprintf(stderr, "            %s <elf-target> <stub.bin> <out>        (pack)\n", argv[0]);
+        fprintf(stderr, "            %s <elf-target> <stub.bin> <out> <key>  (pack + encrypt)\n", argv[0]);
         return 1;
     }
 
@@ -262,7 +282,7 @@ int main(int argc, char **argv) {
         printf("PT_NOTE:         not found\n");
 
     /* Inspect-only mode stops here. */
-    if (argc != 4) {
+    if (argc == 2) {
         munmap(base, size);
         return 0;
     }
@@ -272,6 +292,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: no PT_NOTE to cannibalize\n");
         munmap(base, size);
         return 1;
+    }
+
+    /* A 4th argument is the XOR key and turns on code encryption. */
+    int encrypt = (argc == 5);
+    uint64_t key = 0;
+    if (encrypt) {
+        if (code_idx < 0) {
+            fprintf(stderr, "error: no code segment to encrypt\n");
+            munmap(base, size);
+            return 1;
+        }
+        key = strtoull(argv[4], NULL, 0);
     }
 
     FILE *sf = fopen(argv[2], "rb");
@@ -299,7 +331,8 @@ int main(int argc, char **argv) {
     }
     fclose(sf);
 
-    int rc = pack_elf(argv[3], base, size, stub, (size_t)ssize, (unsigned)note_idx);
+    int rc = pack_elf(argv[3], base, size, stub, (size_t)ssize,
+                      (unsigned)note_idx, (unsigned)code_idx, encrypt, key);
 
     free(stub);
     munmap(base, size);
