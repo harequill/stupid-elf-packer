@@ -362,6 +362,125 @@ objcopy -O binary --only-section=.text stub/stub_dyn.o stub/stub_dyn.bin
 
 Os dois produzem a mesma saída. A diferença é que o `packed_dyn` tirou o OEP da struct, e não do código. É a base para, na etapa da criptografia, passar a chave e a região cifrada pelo mesmo canal.
 
+## A cifragem: onde o código original some
+
+Esta é a etapa que faz o "packer" ser um packer. Como o canal tool para stub já existe e o sequestro de controle já funciona, cifrar é quase de graça: somar dois campos na struct e chamar uma função a mais dos dois lados.
+
+### XOR: a mesma função cifra e decifra
+
+O XOR é a sua própria inversa: `dado ^ chave ^ chave == dado`. A tool aplica o XOR uma vez (cifra), o stub aplica de novo com a mesma chave (decifra). Por isso a chave precisa trafegar da tool para o stub, e é justamente por isso que a gente construiu o canal de metadados primeiro.
+
+A função de cifra vive em `shared/xor.h`, incluída pelos dois lados. É literalmente a mesma função rodando como operação e como inversa. Se um lado divergisse do outro num detalhe, decifraria errado; manter tudo no `shared/` mata esse risco na raiz.
+
+```c
+static inline void xor_apply(uint8_t *data, uint64_t size, uint64_t key) {
+    const uint8_t *k = (const uint8_t *)&key;
+    for (uint64_t i = 0; i < size; i++)
+        data[i] ^= k[i & 7];
+}
+```
+
+### A struct cresce
+
+O bloco de metadados ganha três campos além do OEP: o endereço da região cifrada em memória, o tamanho dela e a chave. Por estar no `shared/`, os dois lados enxergam o layout novo automaticamente.
+
+```c
+struct packer_meta {
+    uint64_t oep;
+    uint64_t code_addr;
+    uint64_t code_size;
+    uint64_t key;
+};
+```
+
+### A tool cifra a região de código
+
+A tool usa o `PT_LOAD` executável que marcou lá na leitura (o segmento `R E`). A região `p_offset .. p_offset + p_filesz` desse segmento é o que ela passa para a função XOR. Depois de cifrar, preenche na struct o endereço em memória (`p_vaddr`), o tamanho e a chave usada. A ordem importa: cifra primeiro, depois grava os metadados com os valores corretos.
+
+### O stub decifra antes de saltar
+
+O stub de cifragem (`stub/stub_crypt.c`) é o primeiro escrito em C, e não em assembly. O motivo é justamente poder incluir a mesma função XOR do `shared/`. Ele é freestanding: sem libc, chamando a syscall crua (número em `rax`, argumentos nos registradores da convenção, instrução `syscall`), no mesmo espírito do salto. A sequência é: lê os metadados, decifra a região de código, salta para o OEP. O código só fica em plain text na memória no instante antes do salto.
+
+#### Cuidado com R^X
+
+O segmento de código está mapeado como read mais execute, sem write. Quando o stub tenta escrever a versão decifrada por cima, o kernel manda `SIGSEGV`: é a proteção de memória funcionando. A solução é o stub chamar `mprotect` para tornar a região gravável antes de decifrar, decifrar, e devolver para `R+X` (não é obrigatório, mas é higiênico) antes de saltar.
+
+O `mprotect` opera em página (4 KB), então o endereço tem que estar alinhado ao início de uma página. A gente alinha o offset para baixo até a fronteira de página e estende o tamanho para cima na mesma conta. Passar um endereço não alinhado dá erro.
+
+#### Cuidado com o estado de registradores
+
+Este é sutil e vale registrar, porque é o tipo de bug que confunde: a cifra funciona, o `main` roda, e mesmo assim o programa quebra.
+
+O `_start` de um alvo não é uma função normal, não assume convenção de chamada. Ele espera o estado cru que o kernel entrega. A ABI x86-64 garante conteúdo definido para dois registradores na entrada do processo: `rsp` (apontando para `argc`, seguido de `argv`, `envp`, `auxv`) e `rdx` (um ponteiro de função de cleanup, o `rtld_fini`, ou zero num binário estático).
+
+O `stub_main`, sendo código C, mexe em registradores livremente. Em particular, as syscalls de `mprotect` usam `rdx` como terceiro argumento (o `prot`), então quando o `stub_main` retorna, `rdx` está sujo com o último `prot`. Se a gente saltar para o OEP com esse `rdx`, o `_start` do glibc lê o valor como `rtld_fini` e registra um ponteiro de lixo como handler de saída. O `main` roda, imprime (para um buffer), faz `return 42`, e no `exit` o handler de lixo é chamado: `SIGSEGV`. Como o `printf` sem `\n` só é descarregado no `exit`, a saída "hello" nem aparece. Dá para ver o `_start` consumindo o `rdx` no disassembly do alvo:
+
+```
+402e46:  49 89 d1   mov %rdx,%r9    # rtld_fini vai para r9 e depois ao __libc_start_main
+```
+
+A correção é o `_start` do stub salvar o `rdx` do kernel cedo, num registrador callee-saved (`rbx`, que o `stub_main` é obrigado a preservar), e restaurar antes do salto. Sobre o `rsp`: como o `_start` do stub não empilha nada além do que o `call` empilha (e o `ret` já tira), o `rsp` chega ao OEP no valor original do kernel e alinhado a 16, então não precisa de tratamento extra aqui.
+
+### A cifragem é opcional
+
+Para os passos anteriores continuarem executáveis, a cifra só liga quando uma chave é passada no CLI. Sem chave, a tool empacota sem cifrar e os stubs identidade e dinâmico seguem funcionando; os campos novos da struct ficam zerados.
+
+```
+./tool/tool <elf>                        inspeciona
+./tool/tool <elf> <stub.bin> <out>        empacota, sem cifrar
+./tool/tool <elf> <stub.bin> <out> <key>  empacota e cifra
+```
+
+### Montando e empacotando
+
+O stub em C é compilado freestanding e extraído como blob flat via um linker script (`stub/stub.ld`) que coloca `_start` primeiro e o label `meta` no fim do código:
+
+```sh
+gcc -c -O2 -nostdlib -ffreestanding -fno-pic -fno-stack-protector \
+    -fcf-protection=none -fno-asynchronous-unwind-tables \
+    -fno-builtin -fno-tree-loop-distribute-patterns \
+    stub/stub_crypt.c -o stub/stub_crypt.o
+ld -T stub/stub.ld -o stub/stub_crypt.elf stub/stub_crypt.o
+objcopy -O binary stub/stub_crypt.elf stub/stub_crypt.bin
+
+./tool/tool target/target stub/stub_crypt.bin target/packed_crypt 0xdeadbeefcafe1234
+```
+
+### As provas
+
+De dentro: o empacotado cifrado roda igual ao original, mesma saída e mesmo código de retorno, mas agora o código trafegou cifrado no arquivo.
+
+```
+original : hello, i am the packer target -> exit 42
+packed   : hello, i am the packer target -> exit 42
+```
+
+De fora: `objdump -d` na região do código do empacotado. Onde antes havia instruções legíveis, agora há os bytes cifrados. O objdump não sabe decifrar, então mostra exatamente o que alguém inspecionando o arquivo veria: nada que faça sentido.
+
+No original, o endereço `0x402e40` (o OEP) tem o `_start` do glibc:
+
+```
+0000000000402e40 <_start>:
+  402e40:  f3 0f 1e fa   endbr64
+  402e44:  31 ed         xor    %ebp,%ebp
+  402e46:  49 89 d1      mov    %rdx,%r9
+  402e49:  5e            pop    %rsi
+  402e4a:  48 89 e2      mov    %rsp,%rdx
+```
+
+No `packed_crypt`, o mesmo endereço vira lixo:
+
+```
+0000000000402e40 <_start>:
+  402e40:  c7                (bad)
+  402e41:  1d e0 30 de 53    sbb    $0x53de30e0,%eax
+  402e46:  e4 57             in     $0x57,%al
+  402e48:  e5 4c             in     $0x4c,%eax
+  402e4a:  b6 43             mov    $0x43,%dh
+```
+
+Esse é o packer: o momento em que o código original some do arquivo, mas o programa ainda roda igual.
+
 ## Status
 
-Em construção. Já existem: o alvo, a tool (validação de ELF, leitura via `mmap`, injeção do stub e escrita do bloco de metadados), o stub identidade e o stub dinâmico (que lê o OEP do bloco de metadados). Próximos passos: cifrar o segmento de código, fazer o stub decifrá-lo antes de saltar para o OEP, e o código compartilhado em `shared/`.
+Funcional de ponta a ponta. Já existem: o alvo; a tool (validação de ELF, leitura via `mmap`, injeção do stub, escrita do bloco de metadados e cifragem opcional do segmento de código); o `shared/` com a struct de metadados e a função XOR; e três stubs (identidade, dinâmico e de cifragem). O `stub_crypt` decifra o código em runtime antes de saltar para o OEP. Evoluções naturais: cifras mais fortes que XOR, o tool patchar o OEP no stub para torná-lo genérico, e suporte a PIE (relocação em runtime).
