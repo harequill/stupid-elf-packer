@@ -3,3 +3,6 @@ stub/stub.bin
 stub/stub.o
 stub/stub_dyn.o
 stub/stub_dyn.bin
+stub/stub_crypt.o
+stub/stub_crypt.bin
+stub/stub_crypt.elf
